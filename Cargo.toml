@@ -1,0 +1,12 @@
+[package]
+name = "bore"
+version = "0.1.0"
+authors = ["Lily Chung <lkdc@mit.edu>"]
+edition = "2018"
+
+[dependencies]
+clap = "2.33.0"
+failure = "0.1.5"
+serde = {version = "1.0", features = ["derive"]}
+serde_cbor = "0.10.1"
+sodiumoxide = "0.2.4"
