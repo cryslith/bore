@@ -2,7 +2,6 @@ use clap::{
   crate_authors, crate_description, crate_name, crate_version, App, AppSettings, Arg, ArgGroup,
   ArgMatches, SubCommand,
 };
-use failure::{bail, format_err, Error};
 use serde::{Deserialize, Serialize};
 use sodiumoxide::crypto::pwhash;
 use sodiumoxide::crypto::secretstream;
@@ -11,14 +10,51 @@ use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use tempfile::NamedTempFile;
+use thiserror::Error;
 
 const BORE_VERSION: u32 = 0;
 // http://nacl.cr.yp.to/valid.html
 const CHUNK_SIZE: usize = 4096;
 const MAX_FRAME_SIZE: usize = 8192; // conservative estimate
 
+#[derive(Debug, Error)]
+enum Error {
+  #[error("Failed to initialize secretstream")]
+  InitStream,
+  #[error("Failed to initialize sodiumoxide")]
+  InitSodiumOxide,
+  #[error("File exists: {0}")]
+  FileExists(String),
+  #[error("Couldn't process filename: {0}")]
+  Filename(String),
+  #[error("Original filename was `{0}`; cannot decrypt from `{1}`")]
+  FilenameMismatch(String, String),
+  #[error("Cannot process file of type {0} v{1}")]
+  FiletypeMismatch(String, u32),
+  #[error("Packet length {0} is larger than max size {1}")]
+  PacketTooLong(usize, usize),
+  #[error("Key derivation failed")]
+  KeyDerivation,
+  #[error("Invalid keyfile")]
+  InvalidKeyfile,
+  #[error("Pushing to secretstream failed")]
+  Push,
+  #[error("Pulling from secretstream failed")]
+  Pull,
+  #[error("Finalizing secretstream failed")]
+  Finalize,
+  #[error("Invalid file header")]
+  InvalidHeader,
+  #[error(transparent)]
+  IO(#[from] std::io::Error),
+  #[error(transparent)]
+  Persist(#[from] tempfile::PersistError),
+  #[error(transparent)]
+  Json(#[from] serde_json::Error),
+}
+
 fn main() -> Result<(), Error> {
-  sodiumoxide::init().map_err(|_| format_err!("Failed to initialize sodiumoxide"))?;
+  sodiumoxide::init().map_err(|_| Error::InitSodiumOxide)?;
 
   let matches = App::new(crate_name!())
     .version(crate_version!())
@@ -85,7 +121,7 @@ fn main() -> Result<(), Error> {
   if let Some(matches) = matches.subcommand_matches("gen-key") {
     return gen_key(matches);
   }
-  bail!("No subcommand");
+  panic!("no subcommand")
 }
 
 // File consists of 1 Header followed by any number of Packets.
@@ -134,9 +170,11 @@ fn read_exact<R: Read>(reader: &mut R, n: usize) -> Result<Vec<u8>, Error> {
 // max_size is the maximum acceptable size of a frame
 fn read_frame<R: Read>(reader: &mut R, max_size: usize) -> Result<Vec<u8>, Error> {
   let len_bytes = read_exact(reader, std::mem::size_of::<u32>())?;
-  let len: usize = u32::from_le_bytes((&len_bytes[..]).try_into().unwrap()).try_into()?;
+  let len: usize = u32::from_le_bytes((&len_bytes[..]).try_into().unwrap())
+    .try_into()
+    .unwrap();
   if len > max_size {
-    bail!("packet length {} is larger than max size {}", len, max_size,);
+    return Err(Error::PacketTooLong(len, max_size));
   }
   read_exact(reader, len)
 }
@@ -149,38 +187,29 @@ fn write_frame<W: Write>(writer: &mut W, frame: Vec<u8>) -> Result<(), Error> {
 
 fn seal(matches: &ArgMatches) -> Result<(), Error> {
   let (key, pw_salt) = if let Some(key_file) = matches.value_of("key-file") {
-    (
-      load_key(key_file).map_err(|e| format_err!("Error loading key file: {}", e))?,
-      None,
-    )
+    (load_key(key_file)?, None)
   } else if let Some(password_file) = matches.value_of("password-file") {
     let salt = pwhash::gen_salt();
-    (
-      key_from_passwd(password_file, salt)
-        .map_err(|e| format_err!("Error generating key from password: {}", e))?,
-      Some(salt),
-    )
+    (key_from_passwd(password_file, salt)?, Some(salt))
   } else {
-    bail!("Must provide either key file or password file");
+    panic!("no key or password");
   };
 
-  let (mut enc_stream, stream_header) = secretstream::Stream::init_push(&key)
-    .map_err(|_| format_err!("Failed to initialize stream"))?;
+  let (mut enc_stream, stream_header) =
+    secretstream::Stream::init_push(&key).map_err(|_| Error::InitStream)?;
 
-  let filename = matches
-    .value_of("input")
-    .ok_or_else(|| format_err!("No input filename"))?;
+  let filename = matches.value_of("input").unwrap();
   let mut input = BufReader::new(fs::File::open(filename)?);
 
   let final_output_path = format!("{}.bore", filename);
   if fs::metadata(&final_output_path).is_ok() {
-    bail!("File exists: {}", final_output_path);
+    return Err(Error::FileExists(final_output_path));
   }
 
   let output_file = NamedTempFile::new_in(
     Path::new(filename)
       .parent()
-      .ok_or_else(|| format_err!("Error extracting parent from {}", filename))?,
+      .ok_or_else(|| Error::Filename(filename.to_string()))?,
   )?;
   let mut output = BufWriter::new(output_file.reopen()?);
 
@@ -197,9 +226,9 @@ fn seal(matches: &ArgMatches) -> Result<(), Error> {
   let inner_header = serde_json::to_vec(&InnerHeader {
     filename: Path::new(filename)
       .file_name()
-      .ok_or_else(|| format_err!("Error extracting filename from {}", filename))?
+      .ok_or_else(|| Error::Filename(filename.to_string()))?
       .to_str()
-      .ok_or_else(|| format_err!("Filename must be valid Unicode"))?
+      .ok_or_else(|| Error::Filename(filename.to_string()))?
       .to_string(),
   })?;
 
@@ -207,7 +236,7 @@ fn seal(matches: &ArgMatches) -> Result<(), Error> {
     &mut output,
     enc_stream
       .push(&inner_header, None, secretstream::Tag::Message)
-      .map_err(|_| format_err!("Pushing inner header failed"))?,
+      .map_err(|_| Error::Push)?,
   )?;
 
   loop {
@@ -219,15 +248,13 @@ fn seal(matches: &ArgMatches) -> Result<(), Error> {
       &mut output,
       enc_stream
         .push(&plaintext, None, secretstream::Tag::Message)
-        .map_err(|_| format_err!("Pushing message failed"))?,
+        .map_err(|_| Error::Push)?,
     )?;
   }
 
   write_frame(
     &mut output,
-    enc_stream
-      .finalize(None)
-      .map_err(|_| format_err!("Finalizing failed"))?,
+    enc_stream.finalize(None).map_err(|_| Error::Finalize)?,
   )?;
 
   output_file.persist(final_output_path)?;
@@ -236,72 +263,61 @@ fn seal(matches: &ArgMatches) -> Result<(), Error> {
 }
 
 fn open(matches: &ArgMatches) -> Result<(), Error> {
-  let input_filename = matches
-    .value_of("input")
-    .ok_or_else(|| format_err!("No input filename"))?;
-  let mut input = BufReader::new(
-    fs::File::open(input_filename).map_err(|e| format_err!("Error opening input file: {}", e))?,
-  );
+  let input_filename = matches.value_of("input").unwrap();
+  let mut input = BufReader::new(fs::File::open(input_filename)?);
 
   let header: Header = serde_json::from_slice(&read_frame(&mut input, MAX_FRAME_SIZE)?[..])?;
 
   if header.r#type != "bore" || header.version != BORE_VERSION {
-    bail!(
-      "Expected file type bore v{}, got {} v{}",
-      BORE_VERSION,
-      header.r#type,
-      header.version,
-    );
+    return Err(Error::FiletypeMismatch(header.r#type, header.version));
   }
 
   let key = if let Some(key_file) = matches.value_of("key-file") {
-    load_key(key_file).map_err(|e| format_err!("Error loading key file: {}", e))?
+    load_key(key_file)?
   } else if let Some(password_file) = matches.value_of("password-file") {
-    let salt = header
-      .pw_salt
-      .ok_or_else(|| format_err!("Password salt not present in file header."))?;
-    key_from_passwd(password_file, salt)
-      .map_err(|e| format_err!("Error generating key from password: {}", e))?
+    let salt = header.pw_salt.ok_or(Error::InvalidHeader)?;
+    key_from_passwd(password_file, salt)?
   } else {
-    bail!("Must provide either key file or password file");
+    panic!("no key or password");
   };
 
-  let mut dec_stream = secretstream::Stream::init_pull(&header.stream_header, &key)
-    .map_err(|_| format_err!("Failed to initialize stream"))?;
+  let mut dec_stream =
+    secretstream::Stream::init_pull(&header.stream_header, &key).map_err(|_| Error::InitStream)?;
 
   let inner_header: InnerHeader = serde_json::from_slice(
     &dec_stream
       .pull(&read_frame(&mut input, MAX_FRAME_SIZE)?[..], None)
-      .map_err(|_| format_err!("Pulling inner header failed"))?
+      .map_err(|_| Error::Pull)?
       .0[..],
   )?;
 
   let input_filepath = Path::new(input_filename);
   let input_name = input_filepath
     .file_name()
-    .ok_or_else(|| format_err!("Error extracting filename from {}", input_filename))?
+    .ok_or_else(|| Error::Filename(input_filename.to_string()))?
     .to_str()
-    .ok_or_else(|| format_err!("Filename must be valid Unicode"))?;
+    .ok_or_else(|| Error::Filename(input_filename.to_string()))?;
   if format!("{}.bore", inner_header.filename) != input_name {
-    bail!(
-      "Original filename was `{}`; cannot decrypt from `{}`",
+    return Err(Error::FilenameMismatch(
       inner_header.filename,
-      input_name,
-    );
+      input_name.to_string(),
+    ));
   }
 
   let final_output_path = input_filepath.with_file_name(&inner_header.filename);
   if fs::metadata(&final_output_path).is_ok() {
-    bail!(
-      "File exists: {}",
-      final_output_path.to_str().unwrap_or(&inner_header.filename)
-    );
+    return Err(Error::FileExists(
+      final_output_path
+        .to_str()
+        .unwrap_or(&inner_header.filename)
+        .to_string(),
+    ));
   }
 
   let output_file = NamedTempFile::new_in(
     input_filepath
       .parent()
-      .ok_or_else(|| format_err!("Error extracting parent from {}", input_filename))?,
+      .ok_or_else(|| Error::Filename(input_filename.to_string()))?,
   )?;
   let mut output = BufWriter::new(output_file.reopen()?);
 
@@ -309,7 +325,7 @@ fn open(matches: &ArgMatches) -> Result<(), Error> {
     output.write_all(
       &dec_stream
         .pull(&read_frame(&mut input, MAX_FRAME_SIZE)?[..], None)
-        .map_err(|_| format_err!("Pulling message failed"))?
+        .map_err(|_| Error::Pull)?
         .0[..],
     )?;
   }
@@ -321,9 +337,7 @@ fn open(matches: &ArgMatches) -> Result<(), Error> {
 
 fn gen_key(matches: &ArgMatches) -> Result<(), Error> {
   let key = secretstream::gen_key();
-  let filename = matches
-    .value_of("output")
-    .ok_or_else(|| format_err!("Must specify filename"))?;
+  let filename = matches.value_of("output").unwrap();
   let mut file = fs::OpenOptions::new()
     .write(true)
     .create_new(true)
@@ -334,15 +348,14 @@ fn gen_key(matches: &ArgMatches) -> Result<(), Error> {
 
 fn load_key(key_file: &str) -> Result<secretstream::Key, Error> {
   let kb = &fs::read(key_file)?;
-  let key = secretstream::Key::from_slice(kb).ok_or_else(|| format_err!("Invalid keyfile"))?;
+  let key = secretstream::Key::from_slice(kb).ok_or(Error::InvalidKeyfile)?;
   return Ok(key);
 }
 
 fn key_from_passwd(passwd_file: &str, salt: pwhash::Salt) -> Result<secretstream::Key, Error> {
   let mut kb = [0; secretstream::KEYBYTES];
   let passwd = fs::read(passwd_file)?;
-  pwhash::derive_key_sensitive(&mut kb, &passwd, &salt)
-    .map_err(|_| format_err!("Key derivation failed"))?;
+  pwhash::derive_key_sensitive(&mut kb, &passwd, &salt).map_err(|_| Error::KeyDerivation)?;
 
   return Ok(secretstream::Key(kb));
 }
